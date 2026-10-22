@@ -2153,7 +2153,80 @@ class Applications(commands.Cog):
         if never_verified:
             bluf = (f"**BOTTOM LINE: {len(never_verified)} member"
                     f"{'' if len(never_verified) == 1 else 's'} need action now.**\n"
-                    f"They never received a verification DM and cannot apply until you fix it.\n\n"
-                    f"Window checked: {window}")
-            await interaction.followup.send(bluf, ephemeral=True)
+                    f"They never received a verification DM and cannot apply until you fix it. "
+                    f"Run `/verify_user` on each of them, or ask them to press **Apply** again.\n")
+        else:
+            bluf = "**BOTTOM LINE: no one is stuck at verification.**\n"
+
+        def names(members):
+            shown = ", ".join(m.mention for m in members[:25])
+            extra = len(members) - 25
+            return shown + (f" and {extra} more" if extra > 0 else "")
+
+        lines = [bluf, f"Window checked: {window}", f"Applied: {applied}"]
+        if never_verified:
+            lines.append(f"Never verified ({len(never_verified)}): {names(never_verified)}")
+        if verified_never_applied:
+            lines.append(
+                f"Verified but never applied ({len(verified_never_applied)}): "
+                f"{names(verified_never_applied)}")
+        if abandoned:
+            lines.append(f"Started but did not finish ({len(abandoned)}): {names(abandoned)}")
+        await interaction.followup.send("\n".join(lines)[:1990], ephemeral=True)
+
+    @app_commands.command(
+        name="verify_user",
+        description="Mark a member as verified so they can apply (e.g. their DMs are closed)")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.describe(member="The member to verify")
+    async def verify_user(self, interaction: Interaction, member: discord.Member):
+        if member.bot:
+            await interaction.response.send_message("Bots don't need verifying.", ephemeral=True)
             return
+        if is_captcha_verified(member.id):
+            await interaction.response.send_message(
+                f"{member.mention} is already verified.", ephemeral=True)
+            return
+        mark_captcha_verified(member.id)
+        logging.info("%s manually verified %s (%s)", interaction.user, member, member.id)
+        await interaction.response.send_message(
+            f"{member.mention} is now verified and can press **Apply**.", ephemeral=True)
+
+    @app_commands.command(
+        name="app_reset",
+        description="Clear a member's application (including a denial) so they can apply again")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.describe(user="The member whose application to clear",
+                           reason="Optional note for the record")
+    async def app_reset(self, interaction: Interaction, user: discord.User,
+                        reason: str | None = None):
+        await interaction.response.defer(ephemeral=True)
+        status = get_application_status(user.id)
+        if status not in BLOCKING_STATUSES:
+            await interaction.followup.send(
+                f"{user.mention} has nothing blocking them from applying.", ephemeral=True)
+            return
+
+        entry = fetch_pending_application_entry(user.id)
+        review_message_id = entry.get("message_id") if entry else None
+
+        delete_pending(user_id=user.id)
+        clear_sessions_for_user(user.id)
+        update_application_status(user.id, "closed", decided_by=str(interaction.user),
+                                  reason=reason or f"Reset by staff (was {status})")
+        try:
+            await retire_review_message(self.bot, interaction.guild, review_message_id)
+        except Exception:
+            pass
+
+        logging.info("%s reset the %s application of %s (%s)",
+                     interaction.user, status, user, user.id)
+        await interaction.followup.send(
+            f"Cleared {user.mention}'s **{status}** application. They can apply again.",
+            ephemeral=True)
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(Applications(bot))
